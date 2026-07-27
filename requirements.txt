@@ -1,0 +1,25 @@
+brotli==1.2.0
+certifi==2026.1.4
+charset-normalizer==3.4.4
+click==8.1.8
+idna==3.11
+mutagen==1.47.0
+numpy==1.19.5
+opencv-contrib-python==4.2.0.34
+Pillow==7.2.0
+pycryptodomex==3.23.0
+python_speech_features==0.6
+requests==2.32.4
+scenedetect==0.5.1
+scipy==1.5.4
+urllib3==2.2.3
+websockets==13.1
+yt-dlp==2024.10.22
+torch==1.10.2
+torchvision==0.11.3
+
+# --- worker (SQS / Postgres / config) ---
+boto3==1.26.163
+botocore==1.29.163
+psycopg2-binary==2.9.11
+python-dotenv==1.0.1
