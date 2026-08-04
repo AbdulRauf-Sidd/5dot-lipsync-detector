@@ -336,15 +336,37 @@ def compute_chunk_score(dists) -> float:
     return float(1.0 - np.mean(quality))
 
 
-def split_video_into_chunks(input_path: str, output_dir: str, chunk_length: int = 5) -> list[str]:
-    os.makedirs(output_dir, exist_ok=True)
+def _probe_duration(input_path: str) -> float:
+    """Container-level format=duration can be stale/inflated -- e.g. after a
+    stream-copy trim, or when a corrupted secondary stream drags the container
+    tag out -- reporting a duration far longer than the video actually plays.
+    Prefer the video stream's own duration and only fall back to the
+    container-level tag if the stream field is unavailable."""
+    stream_result = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", input_path],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    stream_duration = stream_result.stdout.strip()
+    if stream_duration and stream_duration != "N/A":
+        return float(stream_duration)
 
-    result = subprocess.run(
+    format_result = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", input_path],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
-    duration = float(result.stdout)
+    return float(format_result.stdout.strip())
+
+
+def split_video_into_chunks(input_path: str, output_dir: str, chunk_length: int = 5) -> list[tuple[str, float, float]]:
+    """Returns (chunk_path, start, end) tuples -- callers must use these real,
+    rounded-to-nearest-second boundaries rather than re-deriving them from
+    chunk_length, since the last chunk is almost always shorter than the rest."""
+    os.makedirs(output_dir, exist_ok=True)
+
+    duration = _probe_duration(input_path)
 
     chunks = []
     for start in range(0, max(int(duration), 1), chunk_length):
@@ -355,13 +377,13 @@ def split_video_into_chunks(input_path: str, output_dir: str, chunk_length: int 
             "-c", "copy", "-loglevel", "error", chunk_path,
         ]
         subprocess.run(cmd, check=True)
-        chunks.append(chunk_path)
+        chunks.append((chunk_path, float(start), end))
 
-    chunks.sort(key=lambda p: float(os.path.splitext(os.path.basename(p))[0].split("chunk_")[1].split("-")[0]))
+    chunks.sort(key=lambda c: c[1])
     return chunks
 
 
-def infer_chunk(chunk_path: str, data_dir: str = "data/work") -> dict:
+def infer_chunk(chunk_path: str, start: float, end: float, data_dir: str = "data/work") -> dict:
     reference = f"chunk_{os.path.splitext(os.path.basename(chunk_path))[0]}_{os.getpid()}"
     try:
         result = run_inference(
@@ -372,6 +394,8 @@ def infer_chunk(chunk_path: str, data_dir: str = "data/work") -> dict:
         return {
             "chunk": os.path.basename(chunk_path),
             "path": chunk_path,
+            "start": start,
+            "end": end,
             "result": {"probability": score, "num_tracks": len(result["tracks"]), "num_dists": len(result["dists"])},
         }
     except Exception as e:
@@ -379,6 +403,8 @@ def infer_chunk(chunk_path: str, data_dir: str = "data/work") -> dict:
         return {
             "chunk": os.path.basename(chunk_path),
             "path": chunk_path,
+            "start": start,
+            "end": end,
             "result": {"probability": 0.0, "error": str(e)},
         }
     finally:

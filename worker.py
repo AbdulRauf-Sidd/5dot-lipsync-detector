@@ -53,7 +53,7 @@ def _process_chunks(job_id: str, source_path: str) -> list[dict]:
         chunks = split_video_into_chunks(source_path, chunks_dir, CHUNK_LENGTH_SECONDS)
         if not chunks:
             raise RuntimeError("No video chunks could be extracted.")
-        return [infer_chunk(c, data_dir=chunks_dir) for c in chunks]
+        return [infer_chunk(path, start, end, data_dir=chunks_dir) for path, start, end in chunks]
     finally:
         for name in os.listdir(chunks_dir):
             try:
@@ -97,10 +97,8 @@ def process_job(conn, job_id: str) -> None:
         chunk_results = _run_inference_with_retry(job_id, source_path)
 
         for i, r in enumerate(chunk_results):
-            start = i * CHUNK_LENGTH_SECONDS
-            end = start + CHUNK_LENGTH_SECONDS
             score = r["result"].get("probability", 0.0)
-            db.update_chunk(conn, job_id, i, score, start, end)
+            db.update_chunk(conn, job_id, i, score, r["start"], r["end"])
 
         overall_score = sum(r["result"].get("probability", 0.0) for r in chunk_results) / len(chunk_results)
         db.save_result(conn, job_id, overall_score)
