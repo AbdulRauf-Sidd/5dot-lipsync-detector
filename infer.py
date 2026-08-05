@@ -342,14 +342,29 @@ def run_inference(video_path: str, reference: str, skip_persistent_save: bool = 
 
 
 def _confidence_to_score(conf: float) -> float:
-    """Map a single track's SyncNet confidence to a 0-100 score via
-    CONF_SCORE_BANDS."""
+    """Map a single track's SyncNet confidence to a 0-100 score via CONF_SCORE_BANDS."""
     if conf <= 0.0:
         return 0.0
-    dists_array = np.array(dists, dtype=float)
-    clipped = np.clip(dists_array, GOOD_DIST, BAD_DIST)
-    quality = 1.0 - (clipped - GOOD_DIST) / (BAD_DIST - GOOD_DIST)
-    return float(1.0 - np.mean(quality))
+    for conf_lo, conf_hi, score_lo, score_hi in CONF_SCORE_BANDS:
+        if conf_lo <= conf < conf_hi:
+            t = (conf - conf_lo) / (conf_hi - conf_lo)
+            return score_lo + t * (score_hi - score_lo)
+    return CONF_SCORE_BANDS[-1][3]
+
+
+def compute_chunk_score(confs: list) -> float:
+    """Average per-track scores; no evidence defaults to NO_EVIDENCE_SCORE."""
+    if not confs:
+        return NO_EVIDENCE_SCORE
+    return float(np.mean([_confidence_to_score(c) for c in confs]))
+
+
+def label_for_score(score: float) -> str:
+    if score >= 70:
+        return "authentic"
+    if score >= 31:
+        return "uncertain"
+    return "manipulated"
 
 
 def _probe_duration(input_path: str) -> float:

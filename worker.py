@@ -97,7 +97,7 @@ def process_job(conn, job_id: str) -> None:
         chunk_results = _run_inference_with_retry(job_id, source_path)
 
         for i, r in enumerate(chunk_results):
-            score = r["result"].get("probability", 0.0)
+            score = r["result"].get("score", 0.0)
             db.update_chunk(conn, job_id, i, score, r["start"], r["end"])
 
         overall_score = sum(r["result"].get("score", 0.0) for r in chunk_results) / len(chunk_results)
