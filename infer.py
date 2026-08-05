@@ -16,11 +16,29 @@ from scipy.io import wavfile
 SYNCNET_MODEL = None
 FACE_DETECTOR = None
 
-# SyncNet distance thresholds used to turn a raw av-offset distance into a
-# 0-1 lipsync-mismatch score (higher = more likely desynced), same mapping
-# the old FastAPI layer used for its "sync_accuracy_percent" summary.
-GOOD_DIST = 4.0
-BAD_DIST = 10.0
+# SyncNet's own per-track confidence (median dist - min dist: how much
+# sharper the best av-offset match is than a typical one) turned into a
+# 0-100 lipsync authenticity score (higher = more likely in sync/authentic).
+# NOTE: this is the inverse of the "higher = more suspicious" polarity used
+# by the sibling ai_audio/ai_video/changes detectors that feed
+# overall_ai_video_score -- whatever combines them needs to account for that.
+#
+# Confidence -> score is piecewise linear across bands calibrated from
+# testing, each with a gap from its neighbor so a chunk never lands in the
+# ambiguous zone between two confidence tiers (e.g. never scores 35, which
+# would be unclear as between the 0-4 and 4-6 confidence bands). Bounds are
+# (conf_lo, conf_hi, score_lo, score_hi).
+CONF_SCORE_BANDS = [
+    (0.0, 4.0, 0.0, 30.0),
+    (4.0, 6.0, 40.0, 60.0),
+    (6.0, 9.0, 70.0, 90.0),
+    (9.0, 12.0, 95.0, 100.0),
+]
+
+# Score used when there's no SyncNet evidence at all (no face track found,
+# or evaluation errored) -- defaults to "authentic" rather than "desynced"
+# so missing data doesn't get misread as a confirmed manipulation signal.
+NO_EVIDENCE_SCORE = 100.0
 
 # The demo default (100) assumes a whole video is being tracked; chunks are
 # only CHUNK_LENGTH_SECONDS long (~125 frames at 25fps for the default 5s),
@@ -250,19 +268,19 @@ def run_syncnet(cfg):
     if len(flist) == 0:
         print(f"[WARN] No crop files found for syncnet evaluation")
         return []
-    
-    dists = []
+
+    confs = []
     for fname in flist:
         try:
             result = s.evaluate(cfg, videofile=fname)
             if result is not None and len(result) > 2:
-                dist_array = result[2]
-                dists.extend(np.array(dist_array).flatten().astype(float).tolist())
+                _, conf, _ = result
+                confs.append(float(np.array(conf)))
         except Exception as e:
             print(f"[WARN] Error evaluating syncnet for {fname}: {e}")
-    
-    print(f"[INFO] Computed {len(dists)} sync distances")
-    return dists
+
+    print(f"[INFO] Computed {len(confs)} sync confidence scores")
+    return confs
 
 def run_inference(video_path: str, reference: str, skip_persistent_save: bool = False,
                    data_dir: str = "data/work", min_track: int = 100):
@@ -312,9 +330,9 @@ def run_inference(video_path: str, reference: str, skip_persistent_save: bool = 
     crop_faces(cfg, tracks)
     
     print(f"[INFO] Running syncnet evaluation...")
-    dists = run_syncnet(cfg)
+    confs = run_syncnet(cfg)
 
-    result = {"tracks": tracks, "dists": dists}
+    result = {"tracks": tracks, "confs": confs}
 
     if not skip_persistent_save:
         with open(os.path.join(cfg.work_dir, reference, "results.pkl"), "wb") as f:
@@ -323,12 +341,10 @@ def run_inference(video_path: str, reference: str, skip_persistent_save: bool = 
     return result
 
 
-def compute_chunk_score(dists) -> float:
-    """Map raw SyncNet distances (lower = better synced) to a 0-1 lipsync
-    mismatch score (higher = more likely desynced), so overall_lipsync_score
-    lines up with overall_ai_video_score's "higher = more suspicious" polarity.
-    No faces/tracks in the chunk -> no evidence of mismatch -> score 0.0."""
-    if not dists:
+def _confidence_to_score(conf: float) -> float:
+    """Map a single track's SyncNet confidence to a 0-100 score via
+    CONF_SCORE_BANDS."""
+    if conf <= 0.0:
         return 0.0
     dists_array = np.array(dists, dtype=float)
     clipped = np.clip(dists_array, GOOD_DIST, BAD_DIST)
@@ -390,13 +406,18 @@ def infer_chunk(chunk_path: str, start: float, end: float, data_dir: str = "data
             chunk_path, reference, skip_persistent_save=True,
             data_dir=data_dir, min_track=CHUNK_MIN_TRACK_FRAMES,
         )
-        score = compute_chunk_score(result["dists"])
+        score = compute_chunk_score(result["confs"])
         return {
             "chunk": os.path.basename(chunk_path),
             "path": chunk_path,
             "start": start,
             "end": end,
-            "result": {"probability": score, "num_tracks": len(result["tracks"]), "num_dists": len(result["dists"])},
+            "result": {
+                "score": score,
+                "label": label_for_score(score),
+                "num_tracks": len(result["tracks"]),
+                "num_confs": len(result["confs"]),
+            },
         }
     except Exception as e:
         print(f"[ERROR] Chunk inference failed: {chunk_path}, error: {e}")

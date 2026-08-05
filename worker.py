@@ -28,7 +28,7 @@ from config.project_config import (
     SQS_QUEUE_URL,
     SYNCNET_CHECKPOINT,
 )
-from infer import infer_chunk, load_models, split_video_into_chunks
+from infer import infer_chunk, label_for_score, load_models, split_video_into_chunks
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(SERVICE_NAME)
@@ -100,10 +100,10 @@ def process_job(conn, job_id: str) -> None:
             score = r["result"].get("probability", 0.0)
             db.update_chunk(conn, job_id, i, score, r["start"], r["end"])
 
-        overall_score = sum(r["result"].get("probability", 0.0) for r in chunk_results) / len(chunk_results)
+        overall_score = sum(r["result"].get("score", 0.0) for r in chunk_results) / len(chunk_results)
         db.save_result(conn, job_id, overall_score)
 
-        webhook.notify(job_id, "complete", {"score": overall_score})
+        webhook.notify(job_id, "complete", {"score": overall_score, "label": label_for_score(overall_score)})
 
     except Exception as exc:
         logger.exception("Job %s failed", job_id)
