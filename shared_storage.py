@@ -11,6 +11,8 @@ import logging
 import os
 import shutil
 import time
+import uuid
+from typing import Optional
 
 from config.project_config import AWS_BUCKET_NAME, SHARED_JOBS_DIR
 from utils.s3 import download_file
@@ -79,28 +81,67 @@ def get_source_file(job: dict) -> str:
     done_path = _done_path(job_id)
     source_path = os.path.join(job_dir, f"source{_source_ext(job)}")
 
-    try:
-        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
-        return _wait_for_download(job_id, done_path, source_path)
+    while True:
+        # A done marker is only written after the fully downloaded file has
+        # been moved into place.
+        if os.path.exists(done_path) and os.path.exists(source_path):
+            return source_path
 
-    # We won the race: we own the download.
-    try:
-        os.write(fd, str(os.getpid()).encode())
-    finally:
-        os.close(fd)
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            downloaded_path = _wait_for_download(job_id, done_path, source_path)
+            if downloaded_path:
+                return downloaded_path
+            # The owning worker failed and released its lock. Race with the
+            # other waiters to become the next downloader.
+            continue
 
-    _download_source(job, source_path)
-    with open(done_path, "w") as f:
-        f.write(os.path.basename(source_path))
-    return source_path
+        # We won the race: we own the download.  Always remove the lock so a
+        # failed download cannot leave every other worker waiting forever.
+        source_stem, source_ext = os.path.splitext(source_path)
+        # Keep the real extension: yt-dlp uses it to select its final merged
+        # output name.
+        temp_path = f"{source_stem}.{uuid.uuid4().hex}.part{source_ext}"
+        try:
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            fd = None
+
+            # A previous interrupted attempt may have left a stale marker.
+            # Do not advertise a source until this attempt has completed.
+            try:
+                os.unlink(done_path)
+            except FileNotFoundError:
+                pass
+
+            _download_source(job, temp_path)
+            os.replace(temp_path, source_path)
+            with open(done_path, "w") as f:
+                f.write(os.path.basename(source_path))
+            return source_path
+        finally:
+            if fd is not None:
+                os.close(fd)
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
+            try:
+                os.unlink(lock_path)
+            except FileNotFoundError:
+                pass
 
 
-def _wait_for_download(job_id: str, done_path: str, source_path: str) -> str:
+def _wait_for_download(
+    job_id: str, done_path: str, source_path: str
+) -> Optional[str]:
     deadline = time.time() + DOWNLOAD_WAIT_TIMEOUT_SECONDS
     while time.time() < deadline:
-        if os.path.exists(done_path):
+        if os.path.exists(done_path) and os.path.exists(source_path):
             return source_path
+        if not os.path.exists(_lock_path(job_id)):
+            return None
         time.sleep(DOWNLOAD_WAIT_POLL_SECONDS)
     raise SharedDownloadError(
         f"job {job_id}: timed out after {DOWNLOAD_WAIT_TIMEOUT_SECONDS}s waiting for "
