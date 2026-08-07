@@ -41,6 +41,7 @@ DB_PORT = int(os.getenv("DB_PORT", "5432"))
 # --- Webhook ---
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://core-service.placeholder/webhook")
 WEBHOOK_MAX_RETRIES = 3
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
 # --- AWS S3 (source download) ---
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
