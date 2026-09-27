@@ -36,15 +36,22 @@ logger = logging.getLogger(SERVICE_NAME)
 INFERENCE_MAX_ATTEMPTS = 3  # 1 initial attempt + 2 retries, per transient errors like CUDA OOM
 
 
+def parse_sqs_message(message: dict) -> dict:
+    body = message.get("Body")
+    if isinstance(body, str):
+        try:
+            parsed = json.loads(body)
+            if isinstance(parsed, dict):
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return {"job_id": body.strip()}
+    return {"job_id": str(body)}
+
+
 def extract_job_id(message: dict) -> str:
-    body = message["Body"]
-    try:
-        parsed = json.loads(body)
-        if isinstance(parsed, dict) and "job_id" in parsed:
-            return str(parsed["job_id"])
-    except (json.JSONDecodeError, TypeError):
-        pass
-    return body.strip()
+    parsed = parse_sqs_message(message)
+    return str(parsed.get("job_id", "")).strip()
 
 
 def _process_chunks(job_id: str, source_path: str) -> list[dict]:
@@ -81,11 +88,25 @@ def _run_inference_with_retry(job_id: str, source_path: str) -> list[dict]:
     raise last_exc
 
 
-def process_job(conn, job_id: str) -> None:
+def process_job(conn, job_id: str, message_meta: dict | None = None) -> None:
     job = db.fetch_job(conn, job_id)
     if not job:
         logger.error("Job %s not found in detection_requests", job_id)
         return
+
+    if message_meta:
+        if message_meta.get("s3_key"):
+            if job.get("file_key") and job["file_key"] != message_meta["s3_key"]:
+                logger.warning(
+                    "Job %s: DB file_key %s differs from SQS s3_key %s; using SQS s3_key",
+                    job_id,
+                    job.get("file_key"),
+                    message_meta["s3_key"],
+                )
+            job["file_key"] = message_meta["s3_key"]
+        if message_meta.get("url_source") and not job.get("url_source"):
+            job["url_source"] = message_meta["url_source"]
+
     if not job.get("detect_lipsync"):
         logger.info("Job %s did not request lipsync detection, skipping", job_id)
         return
@@ -141,11 +162,12 @@ def main():
 
         last_activity_at = time.time()
         message = messages[0]
-        job_id = extract_job_id(message)
+        message_meta = parse_sqs_message(message)
+        job_id = str(message_meta.get("job_id", "")).strip()
 
         logger.info("Received job %s", job_id)
         try:
-            process_job(conn, job_id)
+            process_job(conn, job_id, message_meta=message_meta)
         except Exception:
             logger.exception("Unhandled error processing job %s", job_id)
         finally:

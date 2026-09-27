@@ -12,6 +12,7 @@ import os
 import shutil
 import time
 
+from botocore.exceptions import ClientError
 from config.project_config import AWS_BUCKET_NAME, SHARED_JOBS_DIR
 from utils.s3 import download_file
 
@@ -59,10 +60,23 @@ def _download_url(url: str, dest_path: str) -> None:
         ydl.download([url])
 
 
+def _download_file_with_fallback(key: str, dest_path: str) -> None:
+    try:
+        logger.info("Downloading s3://%s/%s -> %s", AWS_BUCKET_NAME, key, dest_path)
+        download_file(key, dest_path)
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in ("404", "NoSuchKey", "NotFound"):
+            alt_key = key[len("clips/"):] if key.startswith("clips/") else f"clips/{key}"
+            logger.warning("S3 object %s not found; retrying with fallback key %s", key, alt_key)
+            download_file(alt_key, dest_path)
+            return
+        raise
+
+
 def _download_source(job: dict, dest_path: str) -> None:
     if job.get("file_key"):
-        logger.info("Downloading s3://%s/%s -> %s", AWS_BUCKET_NAME, job["file_key"], dest_path)
-        download_file(job["file_key"], dest_path)
+        _download_file_with_fallback(job["file_key"], dest_path)
     elif job.get("url_source"):
         logger.info("Downloading %s -> %s", job["url_source"], dest_path)
         _download_url(job["url_source"], dest_path)
