@@ -133,7 +133,13 @@ class Detect(object):
         self.variance = variance
         self.nms_top_k = nms_top_k
 
-    def forward(self, loc_data, conf_data, prior_data):
+    def forward(self, loc_data, conf_data, prior_data, conf_thresh=None):
+        # Callers that discard everything below their own threshold anyway can
+        # pass it here: greedy NMS only lets a box suppress lower-scoring ones,
+        # so dropping sub-threshold boxes first leaves the surviving
+        # above-threshold boxes unchanged, while skipping most NMS iterations
+        # (each of which forces a GPU sync).
+        thresh = max(self.conf_thresh, conf_thresh) if conf_thresh is not None else self.conf_thresh
 
         num = loc_data.size(0)
         num_priors = prior_data.size(0)
@@ -152,7 +158,7 @@ class Detect(object):
             conf_scores = conf_preds[i].clone()
 
             for cl in range(1, self.num_classes):
-                c_mask = conf_scores[cl].gt(self.conf_thresh)
+                c_mask = conf_scores[cl].gt(thresh)
                 scores = conf_scores[cl][c_mask]
                 
                 if scores.dim() == 0:

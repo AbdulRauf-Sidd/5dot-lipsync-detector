@@ -1,5 +1,6 @@
 from __future__ import annotations
-import os, pdb, glob, pickle, subprocess, cv2, numpy as np
+import os, glob, pickle, subprocess, cv2, numpy as np
+import torch
 from shutil import rmtree
 from concurrent.futures import ThreadPoolExecutor
 from scipy.interpolate import interp1d
@@ -8,9 +9,11 @@ from scenedetect.scene_manager import SceneManager
 from scenedetect.stats_manager import StatsManager
 from scenedetect.detectors import ContentDetector
 from detectors import S3FD
+from detectors.s3fd.box_utils import nms_
 from SyncNetInstance import SyncNetInstance
 from scipy import signal
 from scipy.io import wavfile
+from timing import timed
 
 
 SYNCNET_MODEL = None
@@ -73,6 +76,9 @@ class Config:
         self.min_track = min_track
         self.num_failed_det = 25
         self.min_face_size = 100
+        self.facedet_conf_th = 0.9
+        # Frames per S3FD forward pass. Halved automatically on CUDA OOM.
+        self.facedet_batch_size = 16
         self.batch_size = 20
         self.vshift = 15
 
@@ -111,21 +117,29 @@ def scene_detect(cfg):
 
     return scene_list
 
-def detect_frame(DET, idx, fname, scale):
-    if not os.path.isfile(fname):
-        print(f"[WARN] Frame not found: {fname}")
-        return idx, []
-    
+def load_frame(fname, scale):
+    """Read + preprocess one frame for S3FD. Runs in worker threads (cv2
+    releases the GIL), so it overlaps with the GPU forward of the prior batch."""
     image = cv2.imread(fname)
     if image is None:
         print(f"[WARN] Failed to read frame: {fname}")
-        return idx, []
-    
+        return None
     image_np = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    bboxes = DET.detect_faces(image_np, conf_th=0.9, scales=[scale])
-    return idx, bboxes
+    return S3FD.preprocess(image_np, scale), image_np.shape[1], image_np.shape[0]
 
-def inference_video(cfg):
+def detect_batch_safe(DET, batch, w, h, conf_th):
+    try:
+        return DET.detect_batch(batch, w, h, conf_th)
+    except torch.cuda.OutOfMemoryError:
+        if len(batch) == 1:
+            raise
+        torch.cuda.empty_cache()
+        mid = len(batch) // 2
+        print(f"[WARN] CUDA OOM on face detection batch of {len(batch)}, splitting")
+        return (detect_batch_safe(DET, batch[:mid], w, h, conf_th)
+                + detect_batch_safe(DET, batch[mid:], w, h, conf_th))
+
+def inference_video(cfg, timings=None):
     """
     Use preloaded FACE_DETECTOR instead of creating a new one every call.
     """
@@ -135,12 +149,32 @@ def inference_video(cfg):
         raise FileNotFoundError(f"No frames found in {os.path.join(cfg.frames_dir, cfg.reference)}")
     dets = [[] for _ in flist]
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        results = list(executor.map(lambda f: detect_frame(DET, *f, cfg.facedet_scale), enumerate(flist)))
+    bs = cfg.facedet_batch_size
+    batches = [range(i, min(i + bs, len(flist))) for i in range(0, len(flist), bs)]
 
-    for idx, bboxes in results:
-        for bbox in bboxes:
-            dets[idx].append({"frame": idx, "bbox": bbox[:-1].tolist(), "conf": bbox[-1]})
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        def submit(batch):
+            return [executor.submit(load_frame, flist[idx], cfg.facedet_scale) for idx in batch]
+
+        pending = submit(batches[0])
+        for bi, batch in enumerate(batches):
+            with timed(timings, "face_detection/load_wait"):
+                loaded = [f.result() for f in pending]
+            pending = submit(batches[bi + 1]) if bi + 1 < len(batches) else None
+
+            # Group by frame size so each forward pass gets a uniform stack
+            # (frames of one video always share a size; this is just a guard).
+            groups = {}
+            for idx, item in zip(batch, loaded):
+                if item is not None:
+                    groups.setdefault((item[1], item[2]), []).append((idx, item[0]))
+
+            for (w, h), items in groups.items():
+                with timed(timings, "face_detection/forward"):
+                    results = detect_batch_safe(DET, np.stack([img for _, img in items]), w, h, cfg.facedet_conf_th)
+                for (idx, _), bboxes in zip(items, results):
+                    for bbox in bboxes[nms_(bboxes, 0.1)]:
+                        dets[idx].append({"frame": idx, "bbox": bbox[:-1].tolist(), "conf": bbox[-1]})
 
     return dets
 
@@ -177,7 +211,7 @@ def track_shot(cfg, scenefaces):
     return tracks
 
         
-def crop_video(opt,track,cropfile):
+def crop_video(opt,track,cropfile,timings=None):
 
     flist = glob.glob(os.path.join(opt.frames_dir,opt.reference,'*.jpg'))
     flist.sort()
@@ -220,19 +254,20 @@ def crop_video(opt,track,cropfile):
 
     vOut.release()
 
-    command = ("ffmpeg -y -i %s -ss %.3f -to %.3f %s" % (os.path.join(opt.avi_dir,opt.reference,'audio.wav'),audiostart,audioend,audiotmp)) 
-    output = subprocess.call(command, shell=True, stdout=None)
+    with timed(timings, "crop_faces/ffmpeg"):
+        command = ("ffmpeg -y -i %s -ss %.3f -to %.3f %s" % (os.path.join(opt.avi_dir,opt.reference,'audio.wav'),audiostart,audioend,audiotmp)) 
+        output = subprocess.call(command, shell=True, stdout=None)
 
-    if output != 0:
-        pdb.set_trace()
+        if output != 0:
+            raise RuntimeError(f"ffmpeg audio trim failed (exit {output}) for {cropfile}")
 
-    sample_rate, audio = wavfile.read(audiotmp)
+        sample_rate, audio = wavfile.read(audiotmp)
 
-    command = ("ffmpeg -y -i %st.avi -i %s -c:v copy -c:a copy %s.avi" % (cropfile,audiotmp,cropfile))
-    output = subprocess.call(command, shell=True, stdout=None)
+        command = ("ffmpeg -y -i %st.avi -i %s -c:v copy -c:a copy %s.avi" % (cropfile,audiotmp,cropfile))
+        output = subprocess.call(command, shell=True, stdout=None)
 
-    if output != 0:
-        pdb.set_trace()
+        if output != 0:
+            raise RuntimeError(f"ffmpeg audio/video mux failed (exit {output}) for {cropfile}")
 
     print('Written %s'%cropfile)
 
@@ -243,7 +278,7 @@ def crop_video(opt,track,cropfile):
     return {'track':track, 'proc_track':dets}
 
 
-def crop_faces(cfg, tracks):
+def crop_faces(cfg, tracks, timings=None):
     print("[INFO] Cropping faces...")
 
     crop_base = os.path.join(cfg.crop_dir, cfg.reference)
@@ -254,10 +289,10 @@ def crop_faces(cfg, tracks):
         
         print(f"[INFO] Cropping track {idx} -> {cropfile}.avi")
         
-        crop_video(cfg, track, cropfile)
+        crop_video(cfg, track, cropfile, timings=timings)
         
 
-def run_syncnet(cfg):
+def run_syncnet(cfg, timings=None):
     s = SYNCNET_MODEL
     crop_path = os.path.join(cfg.crop_dir, cfg.reference)
     flist = sorted(glob.glob(os.path.join(crop_path, "0*.avi")))
@@ -272,7 +307,7 @@ def run_syncnet(cfg):
     confs = []
     for fname in flist:
         try:
-            result = s.evaluate(cfg, videofile=fname)
+            result = s.evaluate(cfg, videofile=fname, timings=timings)
             if result is not None and len(result) > 2:
                 _, conf, _ = result
                 confs.append(float(np.array(conf)))
@@ -283,15 +318,16 @@ def run_syncnet(cfg):
     return confs
 
 def run_inference(video_path: str, reference: str, skip_persistent_save: bool = False,
-                   data_dir: str = "data/work", min_track: int = 100):
+                   data_dir: str = "data/work", min_track: int = 100, timings: dict | None = None):
 
     cfg = Config(video_path, reference, data_dir=data_dir, min_track=min_track)
 
-    for folder in [cfg.work_dir, cfg.crop_dir, cfg.avi_dir, cfg.frames_dir, cfg.tmp_dir]:
-        path = os.path.join(folder, reference)
-        if os.path.exists(path):
-            rmtree(path)
-        os.makedirs(path)
+    with timed(timings, "setup"):
+        for folder in [cfg.work_dir, cfg.crop_dir, cfg.avi_dir, cfg.frames_dir, cfg.tmp_dir]:
+            path = os.path.join(folder, reference)
+            if os.path.exists(path):
+                rmtree(path)
+            os.makedirs(path)
 
     avi_file = os.path.join(cfg.avi_dir, reference, 'video.avi')
     frames_pattern = os.path.join(cfg.frames_dir, reference, '%06d.jpg')
@@ -300,39 +336,47 @@ def run_inference(video_path: str, reference: str, skip_persistent_save: bool = 
     os.makedirs(os.path.dirname(frames_pattern), exist_ok=True)
 
     print(f"[INFO] Converting video to AVI format...")
-    subprocess.call(f"ffmpeg -y -i {video_path} -qscale:v 2 -async 1 -r 25 -threads 0 {avi_file}", shell=True)
+    with timed(timings, "ffmpeg_convert_avi"):
+        subprocess.call(f"ffmpeg -y -i {video_path} -qscale:v 2 -async 1 -r 25 -threads 0 {avi_file}", shell=True)
     print(f"[INFO] Extracting frames...")
-    subprocess.call(f"ffmpeg -y -i {avi_file} -qscale:v 2 -threads 0 -f image2 {frames_pattern}", shell=True)
+    with timed(timings, "ffmpeg_extract_frames"):
+        subprocess.call(f"ffmpeg -y -i {avi_file} -qscale:v 2 -threads 0 -f image2 {frames_pattern}", shell=True)
     print(f"[INFO] Extracting audio...")
-    subprocess.call(f"ffmpeg -y -i {avi_file} -ac 1 -vn -acodec pcm_s16le -ar 16000 {audio_file}", shell=True)
+    with timed(timings, "ffmpeg_extract_audio"):
+        subprocess.call(f"ffmpeg -y -i {avi_file} -ac 1 -vn -acodec pcm_s16le -ar 16000 {audio_file}", shell=True)
 
     # FACE DETECTION
     print(f"[INFO] Running face detection...")
-    faces = inference_video(cfg)
+    with timed(timings, "face_detection"):
+        faces = inference_video(cfg, timings=timings)
     print(f"[INFO] Detected faces in {len([f for f in faces if f])} frames")
 
     # SCENE DETECTION
     print(f"[INFO] Running scene detection...")
-    scenes = scene_detect(cfg)
+    with timed(timings, "scene_detection"):
+        scenes = scene_detect(cfg)
     print(f"[INFO] Found {len(scenes)} scenes")
 
     # FACE TRACKING
     print(f"[INFO] Running face tracking...")
     tracks = []
-    for shot_idx, shot in enumerate(scenes):
-        if shot[1].frame_num - shot[0].frame_num >= cfg.min_track:
-            shot_tracks = track_shot(cfg, faces[shot[0].frame_num:shot[1].frame_num])
-            tracks.extend(shot_tracks)
-            print(f"[INFO] Shot {shot_idx}: Found {len(shot_tracks)} tracks")
+    with timed(timings, "face_tracking"):
+        for shot_idx, shot in enumerate(scenes):
+            if shot[1].frame_num - shot[0].frame_num >= cfg.min_track:
+                shot_tracks = track_shot(cfg, faces[shot[0].frame_num:shot[1].frame_num])
+                tracks.extend(shot_tracks)
+                print(f"[INFO] Shot {shot_idx}: Found {len(shot_tracks)} tracks")
     
     print(f"[INFO] Total tracks: {len(tracks)}")
 
-    crop_faces(cfg, tracks)
+    with timed(timings, "crop_faces"):
+        crop_faces(cfg, tracks, timings=timings)
     
     print(f"[INFO] Running syncnet evaluation...")
-    confs = run_syncnet(cfg)
+    with timed(timings, "syncnet"):
+        confs = run_syncnet(cfg, timings=timings)
 
-    result = {"tracks": tracks, "confs": confs}
+    result = {"tracks": tracks, "confs": confs, "num_frames": len(faces)}
 
     if not skip_persistent_save:
         with open(os.path.join(cfg.work_dir, reference, "results.pkl"), "wb") as f:
@@ -414,37 +458,54 @@ def split_video_into_chunks(input_path: str, output_dir: str, chunk_length: int 
     return chunks
 
 
-def infer_chunk(chunk_path: str, start: float, end: float, data_dir: str = "data/work") -> dict:
+def infer_chunk(chunk_path: str, start: float, end: float, data_dir: str = "data/work",
+                max_attempts: int = 1) -> dict:
+    """
+    Never raises: after max_attempts failures the chunk gets NO_EVIDENCE_SCORE
+    plus an "error" field, consistent with how a chunk with no face track is
+    scored. Retries are per chunk so a transient error (e.g. CUDA OOM) doesn't
+    force the whole video to be reprocessed. The returned "timings" accumulate
+    across attempts.
+    """
     reference = f"chunk_{os.path.splitext(os.path.basename(chunk_path))[0]}_{os.getpid()}"
+    timings = {}
+    base = {
+        "chunk": os.path.basename(chunk_path),
+        "path": chunk_path,
+        "start": start,
+        "end": end,
+        "timings": timings,
+    }
     try:
-        result = run_inference(
-            chunk_path, reference, skip_persistent_save=True,
-            data_dir=data_dir, min_track=CHUNK_MIN_TRACK_FRAMES,
-        )
+        for attempt in range(1, max_attempts + 1):
+            try:
+                result = run_inference(
+                    chunk_path, reference, skip_persistent_save=True,
+                    data_dir=data_dir, min_track=CHUNK_MIN_TRACK_FRAMES, timings=timings,
+                )
+                break
+            except Exception as e:
+                print(f"[ERROR] Chunk inference failed (attempt {attempt}/{max_attempts}): {chunk_path}, error: {e}")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                if attempt == max_attempts:
+                    return {**base, "result": {
+                        "score": NO_EVIDENCE_SCORE,
+                        "label": label_for_score(NO_EVIDENCE_SCORE),
+                        "error": str(e),
+                    }}
+
         score = compute_chunk_score(result["confs"])
-        return {
-            "chunk": os.path.basename(chunk_path),
-            "path": chunk_path,
-            "start": start,
-            "end": end,
-            "result": {
-                "score": score,
-                "label": label_for_score(score),
-                "num_tracks": len(result["tracks"]),
-                "num_confs": len(result["confs"]),
-            },
-        }
-    except Exception as e:
-        print(f"[ERROR] Chunk inference failed: {chunk_path}, error: {e}")
-        return {
-            "chunk": os.path.basename(chunk_path),
-            "path": chunk_path,
-            "start": start,
-            "end": end,
-            "result": {"probability": 0.0, "error": str(e)},
-        }
+        return {**base, "result": {
+            "score": score,
+            "label": label_for_score(score),
+            "num_tracks": len(result["tracks"]),
+            "num_confs": len(result["confs"]),
+            "num_frames": result["num_frames"],
+        }}
     finally:
-        for folder in ("pyavi", "pytmp", "pywork", "pycrop", "pyframes"):
-            path = os.path.join(data_dir, folder, reference)
-            if os.path.exists(path):
-                rmtree(path, ignore_errors=True)
+        with timed(timings, "cleanup"):
+            for folder in ("pyavi", "pytmp", "pywork", "pycrop", "pyframes"):
+                path = os.path.join(data_dir, folder, reference)
+                if os.path.exists(path):
+                    rmtree(path, ignore_errors=True)

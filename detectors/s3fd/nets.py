@@ -105,8 +105,11 @@ class S3FDNet(nn.Module):
 
         self.softmax = nn.Softmax(dim=-1)
         self.detect = Detect()
+        # PriorBox is built in pure Python (one loop iteration per feature-map
+        # cell), so cache it per input size -- all frames of a video share one.
+        self._priors_cache = {}
 
-    def forward(self, x):
+    def forward(self, x, conf_thresh=None):
         size = x.size()[2:]
         sources = list()
         loc = list()
@@ -161,14 +164,18 @@ class S3FDNet(nn.Module):
         loc = torch.cat([o.view(o.size(0), -1) for o in loc], 1)
         conf = torch.cat([o.view(o.size(0), -1) for o in conf], 1)
 
-        with torch.no_grad():
-            self.priorbox = PriorBox(size, features_maps)
-            self.priors = self.priorbox.forward()
+        key = tuple(size)
+        if key not in self._priors_cache:
+            with torch.no_grad():
+                priors = PriorBox(size, features_maps).forward()
+            self._priors_cache[key] = priors.type(type(x.data)).to(self.device)
+        self.priors = self._priors_cache[key]
 
         output = self.detect.forward(
             loc.view(loc.size(0), -1, 4),
             self.softmax(conf.view(conf.size(0), -1, 2)),
-            self.priors.type(type(x.data)).to(self.device)
+            self.priors,
+            conf_thresh=conf_thresh,
         )
 
         return output

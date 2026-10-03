@@ -41,9 +41,11 @@ class SyncNetInstance(torch.nn.Module):
 
         self.__S__ = S(num_layers_in_fc_layers = num_layers_in_fc_layers).to(device);
 
-    def evaluate(self, opt, videofile):
+    @torch.inference_mode()
+    def evaluate(self, opt, videofile, timings=None):
 
         self.__S__.eval();
+        tPrep = time.perf_counter()
 
         # ========== ==========
         # Convert files
@@ -106,6 +108,9 @@ class SyncNetInstance(torch.nn.Module):
         im_feat = []
         cc_feat = []
 
+        if timings is not None:
+            timings['syncnet/prep'] = timings.get('syncnet/prep', 0.0) + time.perf_counter() - tPrep
+
         tS = time.time()
         for i in range(0,lastframe,opt.batch_size):
             
@@ -127,6 +132,8 @@ class SyncNetInstance(torch.nn.Module):
         # ========== ==========
             
         print('Compute time %.3f sec.' % (time.time()-tS))
+        if timings is not None:
+            timings['syncnet/forward'] = timings.get('syncnet/forward', 0.0) + time.time() - tS
 
         dists = calc_pdist(im_feat,cc_feat,vshift=opt.vshift)
         mdist = torch.mean(torch.stack(dists,1),1)

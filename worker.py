@@ -29,11 +29,12 @@ from config.project_config import (
     SYNCNET_CHECKPOINT,
 )
 from infer import infer_chunk, label_for_score, load_models, split_video_into_chunks
+from timing import format_timings, merge_timings, timed
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(SERVICE_NAME)
 
-INFERENCE_MAX_ATTEMPTS = 3  # 1 initial attempt + 2 retries, per transient errors like CUDA OOM
+INFERENCE_MAX_ATTEMPTS = 3  # per chunk: 1 initial attempt + 2 retries, for transient errors like CUDA OOM
 
 
 def parse_sqs_message(message: dict) -> dict:
@@ -54,13 +55,23 @@ def extract_job_id(message: dict) -> str:
     return str(parsed.get("job_id", "")).strip()
 
 
-def _process_chunks(job_id: str, source_path: str) -> list[dict]:
+def _process_chunks(job_id: str, source_path: str, timings: dict) -> list[dict]:
     chunks_dir = tempfile.mkdtemp(prefix=f"{job_id}_")
     try:
-        chunks = split_video_into_chunks(source_path, chunks_dir, CHUNK_LENGTH_SECONDS)
+        with timed(timings, "split_chunks"):
+            chunks = split_video_into_chunks(source_path, chunks_dir, CHUNK_LENGTH_SECONDS)
         if not chunks:
             raise RuntimeError("No video chunks could be extracted.")
-        return [infer_chunk(path, start, end, data_dir=chunks_dir) for path, start, end in chunks]
+
+        results = []
+        for i, (path, start, end) in enumerate(chunks):
+            t0 = time.perf_counter()
+            r = infer_chunk(path, start, end, data_dir=chunks_dir, max_attempts=INFERENCE_MAX_ATTEMPTS)
+            merge_timings(timings, r["timings"])
+            logger.info("Job %s chunk %d/%d [%.0f-%.0fs] took %.2fs: %s",
+                        job_id, i + 1, len(chunks), start, end, time.perf_counter() - t0, r["result"])
+            results.append(r)
+        return results
     finally:
         for name in os.listdir(chunks_dir):
             try:
@@ -71,21 +82,6 @@ def _process_chunks(job_id: str, source_path: str) -> list[dict]:
             os.rmdir(chunks_dir)
         except OSError:
             pass
-
-
-def _run_inference_with_retry(job_id: str, source_path: str) -> list[dict]:
-    last_exc = None
-    for attempt in range(1, INFERENCE_MAX_ATTEMPTS + 1):
-        try:
-            return _process_chunks(job_id, source_path)
-        except Exception as exc:
-            last_exc = exc
-            logger.warning("Inference attempt %s/%s failed for job %s: %s",
-                            attempt, INFERENCE_MAX_ATTEMPTS, job_id, exc)
-            if DEVICE == "cuda":
-                import torch
-                torch.cuda.empty_cache()
-    raise last_exc
 
 
 def process_job(conn, job_id: str, message_meta: dict | None = None) -> None:
@@ -113,18 +109,24 @@ def process_job(conn, job_id: str, message_meta: dict | None = None) -> None:
 
     db.mark_processing(conn, job_id)
 
+    timings = {}
+    job_t0 = time.perf_counter()
+    video_seconds = 0.0
     try:
-        source_path = shared_storage.get_source_file(job)
-        chunk_results = _run_inference_with_retry(job_id, source_path)
+        with timed(timings, "download_source"):
+            source_path = shared_storage.get_source_file(job)
+        chunk_results = _process_chunks(job_id, source_path, timings)
+        video_seconds = chunk_results[-1]["end"]
 
-        for i, r in enumerate(chunk_results):
-            score = r["result"].get("score", 0.0)
-            db.update_chunk(conn, job_id, i, score, r["start"], r["end"])
+        with timed(timings, "db_writes"):
+            for i, r in enumerate(chunk_results):
+                db.update_chunk(conn, job_id, i, r["result"]["score"], r["start"], r["end"])
 
-        overall_score = sum(r["result"].get("score", 0.0) for r in chunk_results) / len(chunk_results)
-        db.save_result(conn, job_id, overall_score)
+            overall_score = sum(r["result"]["score"] for r in chunk_results) / len(chunk_results)
+            db.save_result(conn, job_id, overall_score)
 
-        webhook.notify(job_id, "complete", {"score": overall_score, "label": label_for_score(overall_score)})
+        with timed(timings, "webhook"):
+            webhook.notify(job_id, "complete", {"score": overall_score, "label": label_for_score(overall_score)})
 
     except Exception as exc:
         logger.exception("Job %s failed", job_id)
@@ -133,6 +135,10 @@ def process_job(conn, job_id: str, message_meta: dict | None = None) -> None:
 
     finally:
         shared_storage.cleanup_if_last(conn, job_id)
+        wall = time.perf_counter() - job_t0
+        speed = f", {wall / video_seconds:.2f}s per video-second" if video_seconds else ""
+        logger.info("Job %s timing breakdown (%.1fs of video%s):\n%s",
+                    job_id, video_seconds, speed, format_timings(timings, wall))
 
 
 def main():
