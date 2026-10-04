@@ -27,7 +27,7 @@ import boto3
 import torch
 from dotenv import load_dotenv
 
-from infer import chunk_boundaries, infer_chunk, load_models
+from infer import chunk_boundaries, infer_chunk, iter_chunks, load_models
 from timing import format_timings, merge_timings, timed
 
 load_dotenv()
@@ -91,11 +91,12 @@ def main():
             chunks = chunks[:args.max_chunks]
 
         results = []
-        for start, end in chunks:
-            c0 = time.perf_counter()
-            r = infer_chunk(source_path, start, end)
+        c0 = time.perf_counter()
+        for start, end, frames, audio in iter_chunks(source_path, chunks, timings):
+            r = infer_chunk(frames, audio, start, end)
             merge_timings(timings, r["timings"])
             results.append((r, time.perf_counter() - c0))
+            c0 = time.perf_counter()
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
     wall = time.perf_counter() - t0

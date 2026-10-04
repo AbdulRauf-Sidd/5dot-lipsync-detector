@@ -27,7 +27,7 @@ from config.project_config import (
     SQS_QUEUE_URL,
     SYNCNET_CHECKPOINT,
 )
-from infer import chunk_boundaries, infer_chunk, label_for_score, load_models
+from infer import chunk_boundaries, infer_chunk, iter_chunks, label_for_score, load_models
 from timing import format_timings, merge_timings, timed
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -61,13 +61,14 @@ def _process_chunks(job_id: str, source_path: str, timings: dict) -> list[dict]:
         raise RuntimeError("No video chunks could be extracted.")
 
     results = []
-    for i, (start, end) in enumerate(chunks):
-        t0 = time.perf_counter()
-        r = infer_chunk(source_path, start, end, max_attempts=INFERENCE_MAX_ATTEMPTS)
+    t0 = time.perf_counter()
+    for i, (start, end, frames, audio) in enumerate(iter_chunks(source_path, chunks, timings)):
+        r = infer_chunk(frames, audio, start, end, max_attempts=INFERENCE_MAX_ATTEMPTS)
         merge_timings(timings, r["timings"])
         logger.info("Job %s chunk %d/%d [%.0f-%.0fs] took %.2fs: %s",
                     job_id, i + 1, len(chunks), start, end, time.perf_counter() - t0, r["result"])
         results.append(r)
+        t0 = time.perf_counter()
     return results
 
 

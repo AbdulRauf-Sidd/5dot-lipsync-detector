@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, json, pickle, subprocess, cv2, numpy as np
+import os, json, pickle, subprocess, tempfile, time, cv2, numpy as np
 import torch
 from concurrent.futures import ThreadPoolExecutor
 from scipy.interpolate import interp1d
@@ -62,18 +62,24 @@ def load_models(device="cuda", syncnet_checkpoint="data/syncnet_v2.model", s3fd_
     print("[INFO] Models loaded")
 
 class Config:
+    frame_rate_default = 25
+
     def __init__(self, video_path, reference, data_dir="data/work", min_track=100):
         self.videofile = video_path
         self.reference = reference
         self.data_dir = data_dir
 
-        self.frame_rate = 25
+        self.frame_rate = Config.frame_rate_default
         self.facedet_scale = 0.25
         self.crop_scale = 0.4
         self.min_track = min_track
         self.num_failed_det = 25
         self.min_face_size = 100
         self.facedet_conf_th = 0.9
+        # Run S3FD on every Nth frame (plus each shot's first/last frame); the
+        # tracker already interpolates boxes across gaps of up to
+        # num_failed_det frames. FACEDET_STRIDE=1 restores every-frame detection.
+        self.facedet_stride = max(1, int(os.getenv("FACEDET_STRIDE", "2")))
         # Frames per S3FD forward pass. Halved automatically on CUDA OOM.
         self.facedet_batch_size = 16
         self.batch_size = 20
@@ -151,18 +157,112 @@ def decode_audio(input_path: str, start=None, end=None, sample_rate: int = AUDIO
     )
     return np.frombuffer(raw, dtype=np.int16)
 
+class VideoChunkReader:
+    """
+    Streams a whole video through a single ffmpeg process at frame_rate and
+    hands it out chunk by chunk, so there is no per-chunk seek/pre-roll and
+    chunk boundaries fall exactly on the frame grid. The next chunk's raw
+    frames are read on a background thread while the caller works on the
+    current one. Frames come out of ffmpeg as yuv420p (half the bytes of bgr24)
+    and are converted to BGR with OpenCV across a thread pool on consumption.
+    """
+
+    def __init__(self, input_path: str, frame_rate: int = 25, convert_threads: int = 8):
+        self.width, self.height = _probe_frame_size(input_path)
+        # I420 needs even dimensions; fall back to letting ffmpeg emit bgr24.
+        self._yuv = self.width % 2 == 0 and self.height % 2 == 0
+        self._frame_bytes = self.width * self.height * 3 // 2 if self._yuv else self.width * self.height * 3
+        # stderr goes to a file so a chatty/corrupt input can't fill the pipe and stall ffmpeg.
+        self._stderr = tempfile.TemporaryFile()
+        self._proc = subprocess.Popen(
+            ["ffmpeg", "-v", "error", "-i", input_path, "-an", "-r", str(frame_rate),
+             "-f", "rawvideo", "-pix_fmt", "yuv420p" if self._yuv else "bgr24", "-"],
+            stdout=subprocess.PIPE, stderr=self._stderr,
+        )
+        self._reader = ThreadPoolExecutor(max_workers=1)  # keeps reads sequential
+        self._converter = ThreadPoolExecutor(max_workers=convert_threads)
+        self.background_read_seconds = 0.0
+
+    def _read_raw(self, n_frames: int) -> np.ndarray:
+        t0 = time.perf_counter()
+        buf = bytearray(n_frames * self._frame_bytes)
+        view = memoryview(buf)
+        got = 0
+        while got < len(buf):
+            k = self._proc.stdout.readinto(view[got:])
+            if not k:
+                break
+            got += k
+        whole = got // self._frame_bytes
+        self.background_read_seconds += time.perf_counter() - t0
+        if whole == 0:
+            return np.empty(0, dtype=np.uint8)
+        return np.frombuffer(buf, dtype=np.uint8, count=whole * self._frame_bytes)
+
+    def _to_bgr(self, raw: np.ndarray) -> np.ndarray:
+        h, w = self.height, self.width
+        if not self._yuv:
+            return raw.reshape(-1, h, w, 3)
+        planes = raw.reshape(-1, h * 3 // 2, w)
+        frames = np.empty((len(planes), h, w, 3), dtype=np.uint8)
+
+        def convert(i):
+            frames[i] = cv2.cvtColor(planes[i], cv2.COLOR_YUV2BGR_I420)
+
+        list(self._converter.map(convert, range(len(planes))))
+        return frames
+
+    def iter_chunks(self, frame_counts: list[int], timings: dict | None = None):
+        """Yield one BGR (N, H, W, 3) array per entry of frame_counts (the last
+        ones may be shorter/empty if the stream ends early)."""
+        pending = self._reader.submit(self._read_raw, frame_counts[0]) if frame_counts else None
+        for i in range(len(frame_counts)):
+            with timed(timings, "decode_wait"):
+                raw = pending.result()
+            pending = self._reader.submit(self._read_raw, frame_counts[i + 1]) if i + 1 < len(frame_counts) else None
+            with timed(timings, "decode_convert"):
+                frames = self._to_bgr(raw)
+            if i == 0 and not len(frames):
+                self._raise_if_failed()
+            yield frames
+
+    def _raise_if_failed(self):
+        if self._proc.wait() != 0:
+            self._stderr.seek(0)
+            err = self._stderr.read().decode(errors="replace")[-500:]
+            raise RuntimeError(f"ffmpeg failed (exit {self._proc.returncode}): {err}")
+
+    def close(self):
+        if self._proc.poll() is None:
+            self._proc.kill()
+        self._proc.wait()
+        # Killing ffmpeg EOFs the pipe, so any in-flight prefetch read returns.
+        self._reader.shutdown(wait=True)
+        self._converter.shutdown(wait=True)
+        self._proc.stdout.close()
+        self._stderr.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
 def scene_detect(frames: np.ndarray) -> list[tuple[int, int]]:
     """[start, end) frame ranges per shot, via PySceneDetect's ContentDetector
-    run directly on the decoded frames (same auto-downscale to ~256px wide
-    that VideoManager.set_downscale_factor() applied)."""
+    run directly on the decoded frames. Downscaling mirrors SceneManager's
+    auto_downscale in scenedetect 0.6.x: factor = max(w, h) / 256, cv2.resize
+    with INTER_LINEAR. (The old StatsManager-backed path also computed an
+    unused, zero-weighted edge map per frame; that cost is gone.)"""
     detector = ContentDetector()
-    width = frames.shape[2]
-    downscale = 1 if width < 256 else width // 256
+    height, width = frames.shape[1:3]
+    factor = max(width, height) / 256.0
+    size = (max(1, round(width / factor)), max(1, round(height / factor))) if factor > 1.0 else None
 
     cuts = []
     for frame_num, frame in enumerate(frames):
-        if downscale > 1:
-            frame = np.ascontiguousarray(frame[::downscale, ::downscale, :])
+        if size is not None:
+            frame = cv2.resize(frame, size, interpolation=cv2.INTER_LINEAR)
         cuts.extend(detector.process_frame(frame_num, frame) or [])
     cuts.extend(detector.post_process(len(frames) - 1) or [])
 
@@ -187,17 +287,26 @@ def detect_batch_safe(DET, batch, w, h, conf_th):
         return (detect_batch_safe(DET, batch[:mid], w, h, conf_th)
                 + detect_batch_safe(DET, batch[mid:], w, h, conf_th))
 
-def inference_video(cfg, frames, timings=None):
+def detection_frames(num_frames, scenes, stride):
+    """Frame indices to run S3FD on: every stride-th frame, plus each shot's
+    first and last frame so tracks still reach the shot boundaries."""
+    idx = set(range(0, num_frames, stride))
+    for start, end in scenes:
+        idx.update((start, end - 1))
+    return sorted(i for i in idx if 0 <= i < num_frames)
+
+def inference_video(cfg, frames, scenes, timings=None):
     """
     Use preloaded FACE_DETECTOR instead of creating a new one every call.
+    Frames not in detection_frames() get no detections; track_shot
+    interpolates across them.
     """
     DET = FACE_DETECTOR
-    if not len(frames):
-        raise ValueError(f"No frames decoded from {cfg.videofile}")
     dets = [[] for _ in range(len(frames))]
 
+    indices = detection_frames(len(frames), scenes, cfg.facedet_stride)
     bs = cfg.facedet_batch_size
-    batches = [range(i, min(i + bs, len(frames))) for i in range(0, len(frames), bs)]
+    batches = [indices[i:i + bs] for i in range(0, len(indices), bs)]
 
     with ThreadPoolExecutor(max_workers=8) as executor:
         def submit(batch):
@@ -246,7 +355,8 @@ def track_shot(cfg, scenefaces):
                     break
         if not track:
             break
-        if len(track) > cfg.min_track:
+        # Scale by stride so min_track still means frames, not detections.
+        if len(track) * cfg.facedet_stride > cfg.min_track:
             framenum = np.array([f["frame"] for f in track])
             bboxes = np.array([f["bbox"] for f in track])
             frame_i = np.arange(framenum[0], framenum[-1]+1)
@@ -324,31 +434,23 @@ def run_syncnet(cfg, crops, timings=None):
     print(f"[INFO] Computed {len(confs)} sync confidence scores")
     return confs
 
-def run_inference(video_path: str, reference: str, skip_persistent_save: bool = False,
-                   data_dir: str = "data/work", min_track: int = 100, timings: dict | None = None,
-                   start: float | None = None, end: float | None = None):
-    """Analyse [start, end) of video_path (the whole file if both are None)."""
+def analyse_frames(cfg, frames, audio, timings=None):
+    """Scene detection, face detection/tracking, cropping and SyncNet on
+    already-decoded BGR frames (at cfg.frame_rate) and 16kHz mono audio."""
+    if not len(frames):
+        raise ValueError(f"No frames decoded from {cfg.videofile}")
 
-    cfg = Config(video_path, reference, data_dir=data_dir, min_track=min_track)
-
-    print(f"[INFO] Decoding video...")
-    with timed(timings, "decode_video"):
-        frames = decode_video(video_path, start, end, cfg.frame_rate)
-    print(f"[INFO] Decoding audio...")
-    with timed(timings, "decode_audio"):
-        audio = decode_audio(video_path, start, end)
-
-    # FACE DETECTION
-    print(f"[INFO] Running face detection...")
-    with timed(timings, "face_detection"):
-        faces = inference_video(cfg, frames, timings=timings)
-    print(f"[INFO] Detected faces in {len([f for f in faces if f])} frames")
-
-    # SCENE DETECTION
+    # SCENE DETECTION (first, so face detection can include shot boundaries)
     print(f"[INFO] Running scene detection...")
     with timed(timings, "scene_detection"):
         scenes = scene_detect(frames)
     print(f"[INFO] Found {len(scenes)} scenes")
+
+    # FACE DETECTION
+    print(f"[INFO] Running face detection...")
+    with timed(timings, "face_detection"):
+        faces = inference_video(cfg, frames, scenes, timings=timings)
+    print(f"[INFO] Detected faces in {len([f for f in faces if f])} frames")
 
     # FACE TRACKING
     print(f"[INFO] Running face tracking...")
@@ -369,7 +471,24 @@ def run_inference(video_path: str, reference: str, skip_persistent_save: bool = 
     with timed(timings, "syncnet"):
         confs = run_syncnet(cfg, crops, timings=timings)
 
-    result = {"tracks": tracks, "confs": confs, "num_frames": len(frames)}
+    return {"tracks": tracks, "confs": confs, "num_frames": len(frames)}
+
+
+def run_inference(video_path: str, reference: str, skip_persistent_save: bool = False,
+                   data_dir: str = "data/work", min_track: int = 100, timings: dict | None = None,
+                   start: float | None = None, end: float | None = None):
+    """Analyse [start, end) of video_path (the whole file if both are None)."""
+
+    cfg = Config(video_path, reference, data_dir=data_dir, min_track=min_track)
+
+    print(f"[INFO] Decoding video...")
+    with timed(timings, "decode_video"):
+        frames = decode_video(video_path, start, end, cfg.frame_rate)
+    print(f"[INFO] Decoding audio...")
+    with timed(timings, "decode_audio"):
+        audio = decode_audio(video_path, start, end)
+
+    result = analyse_frames(cfg, frames, audio, timings=timings)
 
     if not skip_persistent_save:
         out_dir = os.path.join(cfg.work_dir, reference)
@@ -441,10 +560,31 @@ def chunk_boundaries(input_path: str, chunk_length: int = 5) -> list[tuple[float
     ]
 
 
-def infer_chunk(source_path: str, start: float, end: float, max_attempts: int = 1) -> dict:
+def iter_chunks(source_path: str, chunks: list[tuple[float, float]], timings: dict | None = None):
     """
-    Analyse [start, end) of source_path, decoded directly from the source (no
-    chunk files on disk).
+    Yield (start, end, frames, audio) per (start, end) in chunks (from
+    chunk_boundaries()), decoding the whole source once: video streamed
+    through VideoChunkReader (next chunk read in the background), audio
+    decoded up front and sliced. Chunk i covers frames
+    [round(start*fps), round(end*fps)) of the 25fps grid.
+    """
+    with timed(timings, "decode_audio"):
+        audio = decode_audio(source_path)
+
+    fps = Config.frame_rate_default
+    bounds = [(round(start * fps), round(end * fps)) for start, end in chunks]
+    with VideoChunkReader(source_path, fps) as reader:
+        frame_counts = [f1 - f0 for f0, f1 in bounds]
+        for (start, end), frames in zip(chunks, reader.iter_chunks(frame_counts, timings)):
+            a0, a1 = round(start * AUDIO_SAMPLE_RATE), round(end * AUDIO_SAMPLE_RATE)
+            yield start, end, frames, audio[a0:a1]
+        if timings is not None:
+            timings["decode_wait/background_read"] = timings.get("decode_wait/background_read", 0.0) + reader.background_read_seconds
+
+
+def infer_chunk(frames: np.ndarray, audio: np.ndarray, start: float, end: float, max_attempts: int = 1) -> dict:
+    """
+    Analyse one chunk's decoded frames/audio (from iter_chunks).
 
     Never raises: after max_attempts failures the chunk gets NO_EVIDENCE_SCORE
     plus an "error" field, consistent with how a chunk with no face track is
@@ -459,10 +599,8 @@ def infer_chunk(source_path: str, start: float, end: float, max_attempts: int = 
 
     for attempt in range(1, max_attempts + 1):
         try:
-            result = run_inference(
-                source_path, reference, skip_persistent_save=True,
-                min_track=CHUNK_MIN_TRACK_FRAMES, timings=timings, start=start, end=end,
-            )
+            cfg = Config(chunk_name, reference, min_track=CHUNK_MIN_TRACK_FRAMES)
+            result = analyse_frames(cfg, frames, audio, timings=timings)
             break
         except Exception as e:
             print(f"[ERROR] Chunk inference failed (attempt {attempt}/{max_attempts}): {chunk_name}, error: {e}")

@@ -82,7 +82,7 @@ def check_infer_imports():
     the SyncNet/S3FD pipeline functions. Actual weight loading only happens
     inside load_models().
     """
-    from infer import load_models, chunk_boundaries, infer_chunk, compute_chunk_score  # noqa: F401
+    from infer import load_models, chunk_boundaries, iter_chunks, infer_chunk, compute_chunk_score  # noqa: F401
 
 
 def check_worker_module_imports():
