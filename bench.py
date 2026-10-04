@@ -27,7 +27,7 @@ import boto3
 import torch
 from dotenv import load_dotenv
 
-from infer import infer_chunk, load_models, split_video_into_chunks
+from infer import chunk_boundaries, infer_chunk, load_models
 from timing import format_timings, merge_timings, timed
 
 load_dotenv()
@@ -85,15 +85,15 @@ def main():
     try:
         with timed(timings, "download_source"):
             source_path = download_video(args.video, work_dir)
-        with timed(timings, "split_chunks"):
-            chunks = split_video_into_chunks(source_path, os.path.join(work_dir, "chunks"), args.chunk_length)
+        with timed(timings, "plan_chunks"):
+            chunks = chunk_boundaries(source_path, args.chunk_length)
         if args.max_chunks:
             chunks = chunks[:args.max_chunks]
 
         results = []
-        for path, start, end in chunks:
+        for start, end in chunks:
             c0 = time.perf_counter()
-            r = infer_chunk(path, start, end, data_dir=work_dir)
+            r = infer_chunk(source_path, start, end)
             merge_timings(timings, r["timings"])
             results.append((r, time.perf_counter() - c0))
     finally:
@@ -107,7 +107,7 @@ def main():
             f"  frames={res['num_frames']} tracks={res['num_tracks']}")
         print(f"  [{r['start']:6.1f}-{r['end']:6.1f}s] {secs:7.2f}s  score={res['score']:6.1f} {res['label']:<11}{extra}")
 
-    video_seconds = chunks[-1][2] - chunks[0][1] if chunks else 0.0
+    video_seconds = chunks[-1][1] - chunks[0][0] if chunks else 0.0
     per_sec = wall / video_seconds if video_seconds else 0.0
     print(f"\n=== timing breakdown: {len(chunks)} chunks, {video_seconds:.1f}s of video, "
           f"{per_sec:.2f}s per video-second ===")

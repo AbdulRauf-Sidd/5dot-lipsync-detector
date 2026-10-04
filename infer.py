@@ -1,18 +1,13 @@
 from __future__ import annotations
-import os, glob, pickle, subprocess, cv2, numpy as np
+import os, json, pickle, subprocess, cv2, numpy as np
 import torch
-from shutil import rmtree
 from concurrent.futures import ThreadPoolExecutor
 from scipy.interpolate import interp1d
-from scenedetect.video_manager import VideoManager
-from scenedetect.scene_manager import SceneManager
-from scenedetect.stats_manager import StatsManager
 from scenedetect.detectors import ContentDetector
 from detectors import S3FD
 from detectors.s3fd.box_utils import nms_
 from SyncNetInstance import SyncNetInstance
 from scipy import signal
-from scipy.io import wavfile
 from timing import timed
 
 
@@ -47,6 +42,8 @@ NO_EVIDENCE_SCORE = 100.0
 # only CHUNK_LENGTH_SECONDS long (~125 frames at 25fps for the default 5s),
 # so a lower floor is needed or almost no track ever qualifies.
 CHUNK_MIN_TRACK_FRAMES = 15
+
+AUDIO_SAMPLE_RATE = 16000  # what SyncNet's MFCC front end expects
 
 
 def load_models(device="cuda", syncnet_checkpoint="data/syncnet_v2.model", s3fd_checkpoint=None):
@@ -100,31 +97,82 @@ def bb_intersection_over_union(boxA, boxB):
 
     return interArea/(boxAArea + boxBArea - interArea + 1e-6)
 
-def scene_detect(cfg):
-    video_manager = VideoManager([os.path.join(cfg.avi_dir, cfg.reference, "video.avi")])
-    stats_manager = StatsManager()
-    scene_manager = SceneManager(stats_manager)
-    scene_manager.add_detector(ContentDetector())
+def _run_ffmpeg(cmd: list) -> bytes:
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed (exit {proc.returncode}): {proc.stderr.decode(errors='replace')[-500:]}")
+    return proc.stdout
 
-    base_timecode = video_manager.get_base_timecode()
-    video_manager.set_downscale_factor()
-    video_manager.start()
-    scene_manager.detect_scenes(frame_source=video_manager)
+def _seek_args(start, end):
+    # Input-side -ss/-to while decoding is frame accurate (unlike a -c copy cut,
+    # which snaps to keyframes and makes neighbouring chunks overlap).
+    args = []
+    if start is not None:
+        args += ["-ss", str(start)]
+    if end is not None:
+        args += ["-to", str(end)]
+    return args
 
-    scene_list = scene_manager.get_scene_list(base_timecode)
-    if not scene_list:
-        scene_list = [(video_manager.get_base_timecode(), video_manager.get_current_timecode())]
+def _probe_frame_size(input_path: str) -> tuple[int, int]:
+    """Displayed (width, height): ffmpeg auto-rotates on decode, so a 90/270
+    rotation tag (old ffmpeg: tags.rotate, new: side_data_list) swaps them."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_streams", "-of", "json", input_path],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True,
+    )
+    stream = json.loads(result.stdout)["streams"][0]
+    width, height = int(stream["width"]), int(stream["height"])
+    rotation = stream.get("tags", {}).get("rotate")
+    for side_data in stream.get("side_data_list", []):
+        if "rotation" in side_data:
+            rotation = side_data["rotation"]
+    if rotation is not None and abs(int(float(rotation))) % 180 == 90:
+        width, height = height, width
+    return width, height
 
-    return scene_list
+def decode_video(input_path: str, start=None, end=None, frame_rate: int = 25) -> np.ndarray:
+    """Decode [start, end) straight to an (N, H, W, 3) BGR uint8 array at frame_rate.
+    Held in memory for the whole chunk: ~6MB/frame at 1080p, so ~0.8GB per 5s chunk."""
+    width, height = _probe_frame_size(input_path)
+    raw = _run_ffmpeg(
+        ["ffmpeg", "-v", "error"] + _seek_args(start, end) + ["-i", input_path,
+         "-an", "-r", str(frame_rate), "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
+    )
+    frame_bytes = width * height * 3
+    if not raw or len(raw) % frame_bytes:
+        raise RuntimeError(f"Decoded {len(raw)} bytes, not a whole number of {width}x{height} frames: {input_path}")
+    return np.frombuffer(raw, dtype=np.uint8).reshape(-1, height, width, 3)
 
-def load_frame(fname, scale):
-    """Read + preprocess one frame for S3FD. Runs in worker threads (cv2
-    releases the GIL), so it overlaps with the GPU forward of the prior batch."""
-    image = cv2.imread(fname)
-    if image is None:
-        print(f"[WARN] Failed to read frame: {fname}")
-        return None
-    image_np = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+def decode_audio(input_path: str, start=None, end=None, sample_rate: int = AUDIO_SAMPLE_RATE) -> np.ndarray:
+    """Decode [start, end) to mono int16 PCM at sample_rate."""
+    raw = _run_ffmpeg(
+        ["ffmpeg", "-v", "error"] + _seek_args(start, end) + ["-i", input_path,
+         "-vn", "-async", "1", "-ac", "1", "-ar", str(sample_rate), "-acodec", "pcm_s16le", "-f", "s16le", "-"]
+    )
+    return np.frombuffer(raw, dtype=np.int16)
+
+def scene_detect(frames: np.ndarray) -> list[tuple[int, int]]:
+    """[start, end) frame ranges per shot, via PySceneDetect's ContentDetector
+    run directly on the decoded frames (same auto-downscale to ~256px wide
+    that VideoManager.set_downscale_factor() applied)."""
+    detector = ContentDetector()
+    width = frames.shape[2]
+    downscale = 1 if width < 256 else width // 256
+
+    cuts = []
+    for frame_num, frame in enumerate(frames):
+        if downscale > 1:
+            frame = np.ascontiguousarray(frame[::downscale, ::downscale, :])
+        cuts.extend(detector.process_frame(frame_num, frame) or [])
+    cuts.extend(detector.post_process(len(frames) - 1) or [])
+
+    bounds = [0] + sorted(c for c in set(cuts) if 0 < c < len(frames)) + [len(frames)]
+    return list(zip(bounds[:-1], bounds[1:]))
+
+def preprocess_frame(frame, scale):
+    """BGR frame -> S3FD input. Runs in worker threads (cv2 releases the GIL),
+    so it overlaps with the GPU forward of the prior batch."""
+    image_np = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     return S3FD.preprocess(image_np, scale), image_np.shape[1], image_np.shape[0]
 
 def detect_batch_safe(DET, batch, w, h, conf_th):
@@ -139,22 +187,21 @@ def detect_batch_safe(DET, batch, w, h, conf_th):
         return (detect_batch_safe(DET, batch[:mid], w, h, conf_th)
                 + detect_batch_safe(DET, batch[mid:], w, h, conf_th))
 
-def inference_video(cfg, timings=None):
+def inference_video(cfg, frames, timings=None):
     """
     Use preloaded FACE_DETECTOR instead of creating a new one every call.
     """
     DET = FACE_DETECTOR
-    flist = sorted(glob.glob(os.path.join(cfg.frames_dir, cfg.reference, "*.jpg")))
-    if not flist:
-        raise FileNotFoundError(f"No frames found in {os.path.join(cfg.frames_dir, cfg.reference)}")
-    dets = [[] for _ in flist]
+    if not len(frames):
+        raise ValueError(f"No frames decoded from {cfg.videofile}")
+    dets = [[] for _ in range(len(frames))]
 
     bs = cfg.facedet_batch_size
-    batches = [range(i, min(i + bs, len(flist))) for i in range(0, len(flist), bs)]
+    batches = [range(i, min(i + bs, len(frames))) for i in range(0, len(frames), bs)]
 
     with ThreadPoolExecutor(max_workers=8) as executor:
         def submit(batch):
-            return [executor.submit(load_frame, flist[idx], cfg.facedet_scale) for idx in batch]
+            return [executor.submit(preprocess_frame, frames[idx], cfg.facedet_scale) for idx in batch]
 
         pending = submit(batches[0])
         for bi, batch in enumerate(batches):
@@ -166,8 +213,7 @@ def inference_video(cfg, timings=None):
             # (frames of one video always share a size; this is just a guard).
             groups = {}
             for idx, item in zip(batch, loaded):
-                if item is not None:
-                    groups.setdefault((item[1], item[2]), []).append((idx, item[0]))
+                groups.setdefault((item[1], item[2]), []).append((idx, item[0]))
 
             for (w, h), items in groups.items():
                 with timed(timings, "face_detection/forward"):
@@ -211,13 +257,9 @@ def track_shot(cfg, scenefaces):
     return tracks
 
         
-def crop_video(opt,track,cropfile,timings=None):
-
-    flist = glob.glob(os.path.join(opt.frames_dir,opt.reference,'*.jpg'))
-    flist.sort()
-
-    fourcc = cv2.VideoWriter_fourcc(*'XVID')
-    vOut = cv2.VideoWriter(cropfile+'t.avi', fourcc, opt.frame_rate, (224,224))
+def crop_track(opt, frames, audio, track):
+    """Return the track's 224x224 BGR face crops and its matching audio slice,
+    in memory -- what used to round-trip through an XVID .avi for SyncNet."""
 
     dets = {'x':[], 'y':[], 's':[]}
 
@@ -231,6 +273,8 @@ def crop_video(opt,track,cropfile,timings=None):
     dets['x'] = signal.medfilt(dets['x'],kernel_size=13)
     dets['y'] = signal.medfilt(dets['y'],kernel_size=13)
 
+    crops = np.empty((len(track['frame']), 224, 224, 3), dtype=np.uint8)
+
     for fidx, frame in enumerate(track['frame']):
 
         cs  = opt.crop_scale
@@ -238,148 +282,99 @@ def crop_video(opt,track,cropfile,timings=None):
         bs  = dets['s'][fidx]  
         bsi = int(bs*(1+2*cs)) 
 
-        image = cv2.imread(flist[frame])
-        
-        frame = np.pad(image,((bsi,bsi),(bsi,bsi),(0,0)), 'constant', constant_values=(110,110))
+        # Same result as np.pad(..., constant_values=110), several times faster.
+        padded = cv2.copyMakeBorder(frames[frame], bsi, bsi, bsi, bsi, cv2.BORDER_CONSTANT, value=(110, 110, 110))
         my  = dets['y'][fidx]+bsi  
         mx  = dets['x'][fidx]+bsi 
 
-        face = frame[int(my-bs):int(my+bs*(1+2*cs)),int(mx-bs*(1+cs)):int(mx+bs*(1+cs))]
+        face = padded[int(my-bs):int(my+bs*(1+2*cs)),int(mx-bs*(1+cs)):int(mx+bs*(1+cs))]
         
-        vOut.write(cv2.resize(face,(224,224)))
+        crops[fidx] = cv2.resize(face,(224,224))
 
-    audiotmp    = os.path.join(opt.tmp_dir,opt.reference,'audio.wav')
-    audiostart  = (track['frame'][0])/opt.frame_rate
-    audioend    = (track['frame'][-1]+1)/opt.frame_rate
-
-    vOut.release()
-
-    with timed(timings, "crop_faces/ffmpeg"):
-        command = ("ffmpeg -y -i %s -ss %.3f -to %.3f %s" % (os.path.join(opt.avi_dir,opt.reference,'audio.wav'),audiostart,audioend,audiotmp)) 
-        output = subprocess.call(command, shell=True, stdout=None)
-
-        if output != 0:
-            raise RuntimeError(f"ffmpeg audio trim failed (exit {output}) for {cropfile}")
-
-        sample_rate, audio = wavfile.read(audiotmp)
-
-        command = ("ffmpeg -y -i %st.avi -i %s -c:v copy -c:a copy %s.avi" % (cropfile,audiotmp,cropfile))
-        output = subprocess.call(command, shell=True, stdout=None)
-
-        if output != 0:
-            raise RuntimeError(f"ffmpeg audio/video mux failed (exit {output}) for {cropfile}")
-
-    print('Written %s'%cropfile)
-
-    os.remove(cropfile+'t.avi')
+    audiostart  = int(round(track['frame'][0] / opt.frame_rate * AUDIO_SAMPLE_RATE))
+    audioend    = int(round((track['frame'][-1]+1) / opt.frame_rate * AUDIO_SAMPLE_RATE))
 
     print('Mean pos: x %.2f y %.2f s %.2f'%(np.mean(dets['x']),np.mean(dets['y']),np.mean(dets['s'])))
 
-    return {'track':track, 'proc_track':dets}
+    return crops, audio[audiostart:audioend]
 
 
-def crop_faces(cfg, tracks, timings=None):
-    print("[INFO] Cropping faces...")
+def crop_faces(cfg, frames, audio, tracks):
+    print(f"[INFO] Cropping {len(tracks)} track(s)...")
+    return [crop_track(cfg, frames, audio, track) for track in tracks]
 
-    crop_base = os.path.join(cfg.crop_dir, cfg.reference)
-    os.makedirs(crop_base, exist_ok=True)
 
-    for idx, track in enumerate(tracks):
-        cropfile = os.path.join(crop_base, f"{idx:05d}")
-        
-        print(f"[INFO] Cropping track {idx} -> {cropfile}.avi")
-        
-        crop_video(cfg, track, cropfile, timings=timings)
-        
-
-def run_syncnet(cfg, timings=None):
+def run_syncnet(cfg, crops, timings=None):
     s = SYNCNET_MODEL
-    crop_path = os.path.join(cfg.crop_dir, cfg.reference)
-    flist = sorted(glob.glob(os.path.join(crop_path, "0*.avi")))
-    
-    print(f"[INFO] Looking for crop files in: {crop_path}")
-    print(f"[INFO] Found {len(flist)} crop files")
-    
-    if len(flist) == 0:
-        print(f"[WARN] No crop files found for syncnet evaluation")
+
+    if len(crops) == 0:
+        print(f"[WARN] No face tracks for syncnet evaluation")
         return []
 
     confs = []
-    for fname in flist:
+    for idx, (images, audio) in enumerate(crops):
         try:
-            result = s.evaluate(cfg, videofile=fname, timings=timings)
+            result = s.evaluate_arrays(cfg, images, audio, sample_rate=AUDIO_SAMPLE_RATE, timings=timings)
             if result is not None and len(result) > 2:
                 _, conf, _ = result
                 confs.append(float(np.array(conf)))
         except Exception as e:
-            print(f"[WARN] Error evaluating syncnet for {fname}: {e}")
+            print(f"[WARN] Error evaluating syncnet for track {idx}: {e}")
 
     print(f"[INFO] Computed {len(confs)} sync confidence scores")
     return confs
 
 def run_inference(video_path: str, reference: str, skip_persistent_save: bool = False,
-                   data_dir: str = "data/work", min_track: int = 100, timings: dict | None = None):
+                   data_dir: str = "data/work", min_track: int = 100, timings: dict | None = None,
+                   start: float | None = None, end: float | None = None):
+    """Analyse [start, end) of video_path (the whole file if both are None)."""
 
     cfg = Config(video_path, reference, data_dir=data_dir, min_track=min_track)
 
-    with timed(timings, "setup"):
-        for folder in [cfg.work_dir, cfg.crop_dir, cfg.avi_dir, cfg.frames_dir, cfg.tmp_dir]:
-            path = os.path.join(folder, reference)
-            if os.path.exists(path):
-                rmtree(path)
-            os.makedirs(path)
-
-    avi_file = os.path.join(cfg.avi_dir, reference, 'video.avi')
-    frames_pattern = os.path.join(cfg.frames_dir, reference, '%06d.jpg')
-    audio_file = os.path.join(cfg.avi_dir, reference, 'audio.wav')
-
-    os.makedirs(os.path.dirname(frames_pattern), exist_ok=True)
-
-    print(f"[INFO] Converting video to AVI format...")
-    with timed(timings, "ffmpeg_convert_avi"):
-        subprocess.call(f"ffmpeg -y -i {video_path} -qscale:v 2 -async 1 -r 25 -threads 0 {avi_file}", shell=True)
-    print(f"[INFO] Extracting frames...")
-    with timed(timings, "ffmpeg_extract_frames"):
-        subprocess.call(f"ffmpeg -y -i {avi_file} -qscale:v 2 -threads 0 -f image2 {frames_pattern}", shell=True)
-    print(f"[INFO] Extracting audio...")
-    with timed(timings, "ffmpeg_extract_audio"):
-        subprocess.call(f"ffmpeg -y -i {avi_file} -ac 1 -vn -acodec pcm_s16le -ar 16000 {audio_file}", shell=True)
+    print(f"[INFO] Decoding video...")
+    with timed(timings, "decode_video"):
+        frames = decode_video(video_path, start, end, cfg.frame_rate)
+    print(f"[INFO] Decoding audio...")
+    with timed(timings, "decode_audio"):
+        audio = decode_audio(video_path, start, end)
 
     # FACE DETECTION
     print(f"[INFO] Running face detection...")
     with timed(timings, "face_detection"):
-        faces = inference_video(cfg, timings=timings)
+        faces = inference_video(cfg, frames, timings=timings)
     print(f"[INFO] Detected faces in {len([f for f in faces if f])} frames")
 
     # SCENE DETECTION
     print(f"[INFO] Running scene detection...")
     with timed(timings, "scene_detection"):
-        scenes = scene_detect(cfg)
+        scenes = scene_detect(frames)
     print(f"[INFO] Found {len(scenes)} scenes")
 
     # FACE TRACKING
     print(f"[INFO] Running face tracking...")
     tracks = []
     with timed(timings, "face_tracking"):
-        for shot_idx, shot in enumerate(scenes):
-            if shot[1].frame_num - shot[0].frame_num >= cfg.min_track:
-                shot_tracks = track_shot(cfg, faces[shot[0].frame_num:shot[1].frame_num])
+        for shot_idx, (shot_start, shot_end) in enumerate(scenes):
+            if shot_end - shot_start >= cfg.min_track:
+                shot_tracks = track_shot(cfg, faces[shot_start:shot_end])
                 tracks.extend(shot_tracks)
                 print(f"[INFO] Shot {shot_idx}: Found {len(shot_tracks)} tracks")
     
     print(f"[INFO] Total tracks: {len(tracks)}")
 
     with timed(timings, "crop_faces"):
-        crop_faces(cfg, tracks, timings=timings)
+        crops = crop_faces(cfg, frames, audio, tracks)
     
     print(f"[INFO] Running syncnet evaluation...")
     with timed(timings, "syncnet"):
-        confs = run_syncnet(cfg, timings=timings)
+        confs = run_syncnet(cfg, crops, timings=timings)
 
-    result = {"tracks": tracks, "confs": confs, "num_frames": len(faces)}
+    result = {"tracks": tracks, "confs": confs, "num_frames": len(frames)}
 
     if not skip_persistent_save:
-        with open(os.path.join(cfg.work_dir, reference, "results.pkl"), "wb") as f:
+        out_dir = os.path.join(cfg.work_dir, reference)
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(out_dir, "results.pkl"), "wb") as f:
             pickle.dump(result, f)
 
     return result
@@ -435,77 +430,56 @@ def _probe_duration(input_path: str) -> float:
     return float(format_result.stdout.strip())
 
 
-def split_video_into_chunks(input_path: str, output_dir: str, chunk_length: int = 5) -> list[tuple[str, float, float]]:
-    """Returns (chunk_path, start, end) tuples -- callers must use these real,
+def chunk_boundaries(input_path: str, chunk_length: int = 5) -> list[tuple[float, float]]:
+    """Returns (start, end) tuples -- callers must use these real,
     rounded-to-nearest-second boundaries rather than re-deriving them from
     chunk_length, since the last chunk is almost always shorter than the rest."""
-    os.makedirs(output_dir, exist_ok=True)
-
     duration = _probe_duration(input_path)
-
-    chunks = []
-    for start in range(0, max(int(duration), 1), chunk_length):
-        end = min(start + chunk_length, duration)
-        chunk_path = os.path.join(output_dir, f"chunk_{start}-{end}.mp4")
-        cmd = [
-            "ffmpeg", "-y", "-ss", str(start), "-to", str(end), "-i", input_path,
-            "-c", "copy", "-loglevel", "error", chunk_path,
-        ]
-        subprocess.run(cmd, check=True)
-        chunks.append((chunk_path, float(start), end))
-
-    chunks.sort(key=lambda c: c[1])
-    return chunks
+    return [
+        (float(start), min(start + chunk_length, duration))
+        for start in range(0, max(int(duration), 1), chunk_length)
+    ]
 
 
-def infer_chunk(chunk_path: str, start: float, end: float, data_dir: str = "data/work",
-                max_attempts: int = 1) -> dict:
+def infer_chunk(source_path: str, start: float, end: float, max_attempts: int = 1) -> dict:
     """
+    Analyse [start, end) of source_path, decoded directly from the source (no
+    chunk files on disk).
+
     Never raises: after max_attempts failures the chunk gets NO_EVIDENCE_SCORE
     plus an "error" field, consistent with how a chunk with no face track is
     scored. Retries are per chunk so a transient error (e.g. CUDA OOM) doesn't
     force the whole video to be reprocessed. The returned "timings" accumulate
     across attempts.
     """
-    reference = f"chunk_{os.path.splitext(os.path.basename(chunk_path))[0]}_{os.getpid()}"
+    chunk_name = f"chunk_{start:g}-{end:g}"
+    reference = f"{chunk_name}_{os.getpid()}"
     timings = {}
-    base = {
-        "chunk": os.path.basename(chunk_path),
-        "path": chunk_path,
-        "start": start,
-        "end": end,
-        "timings": timings,
-    }
-    try:
-        for attempt in range(1, max_attempts + 1):
-            try:
-                result = run_inference(
-                    chunk_path, reference, skip_persistent_save=True,
-                    data_dir=data_dir, min_track=CHUNK_MIN_TRACK_FRAMES, timings=timings,
-                )
-                break
-            except Exception as e:
-                print(f"[ERROR] Chunk inference failed (attempt {attempt}/{max_attempts}): {chunk_path}, error: {e}")
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                if attempt == max_attempts:
-                    return {**base, "result": {
-                        "score": NO_EVIDENCE_SCORE,
-                        "label": label_for_score(NO_EVIDENCE_SCORE),
-                        "error": str(e),
-                    }}
+    base = {"chunk": chunk_name, "start": start, "end": end, "timings": timings}
 
-        score = compute_chunk_score(result["confs"])
-        return {**base, "result": {
-            "score": score,
-            "label": label_for_score(score),
-            "num_tracks": len(result["tracks"]),
-            "num_confs": len(result["confs"]),
-            "num_frames": result["num_frames"],
-        }}
-    finally:
-        with timed(timings, "cleanup"):
-            for folder in ("pyavi", "pytmp", "pywork", "pycrop", "pyframes"):
-                path = os.path.join(data_dir, folder, reference)
-                if os.path.exists(path):
-                    rmtree(path, ignore_errors=True)
+    for attempt in range(1, max_attempts + 1):
+        try:
+            result = run_inference(
+                source_path, reference, skip_persistent_save=True,
+                min_track=CHUNK_MIN_TRACK_FRAMES, timings=timings, start=start, end=end,
+            )
+            break
+        except Exception as e:
+            print(f"[ERROR] Chunk inference failed (attempt {attempt}/{max_attempts}): {chunk_name}, error: {e}")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if attempt == max_attempts:
+                return {**base, "result": {
+                    "score": NO_EVIDENCE_SCORE,
+                    "label": label_for_score(NO_EVIDENCE_SCORE),
+                    "error": str(e),
+                }}
+
+    score = compute_chunk_score(result["confs"])
+    return {**base, "result": {
+        "score": score,
+        "label": label_for_score(score),
+        "num_tracks": len(result["tracks"]),
+        "num_confs": len(result["confs"]),
+        "num_frames": result["num_frames"],
+    }}

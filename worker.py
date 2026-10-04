@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import tempfile
 import time
 
 import boto3
@@ -28,7 +27,7 @@ from config.project_config import (
     SQS_QUEUE_URL,
     SYNCNET_CHECKPOINT,
 )
-from infer import infer_chunk, label_for_score, load_models, split_video_into_chunks
+from infer import chunk_boundaries, infer_chunk, label_for_score, load_models
 from timing import format_timings, merge_timings, timed
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -56,32 +55,20 @@ def extract_job_id(message: dict) -> str:
 
 
 def _process_chunks(job_id: str, source_path: str, timings: dict) -> list[dict]:
-    chunks_dir = tempfile.mkdtemp(prefix=f"{job_id}_")
-    try:
-        with timed(timings, "split_chunks"):
-            chunks = split_video_into_chunks(source_path, chunks_dir, CHUNK_LENGTH_SECONDS)
-        if not chunks:
-            raise RuntimeError("No video chunks could be extracted.")
+    with timed(timings, "plan_chunks"):
+        chunks = chunk_boundaries(source_path, CHUNK_LENGTH_SECONDS)
+    if not chunks:
+        raise RuntimeError("No video chunks could be extracted.")
 
-        results = []
-        for i, (path, start, end) in enumerate(chunks):
-            t0 = time.perf_counter()
-            r = infer_chunk(path, start, end, data_dir=chunks_dir, max_attempts=INFERENCE_MAX_ATTEMPTS)
-            merge_timings(timings, r["timings"])
-            logger.info("Job %s chunk %d/%d [%.0f-%.0fs] took %.2fs: %s",
-                        job_id, i + 1, len(chunks), start, end, time.perf_counter() - t0, r["result"])
-            results.append(r)
-        return results
-    finally:
-        for name in os.listdir(chunks_dir):
-            try:
-                os.remove(os.path.join(chunks_dir, name))
-            except OSError:
-                pass
-        try:
-            os.rmdir(chunks_dir)
-        except OSError:
-            pass
+    results = []
+    for i, (start, end) in enumerate(chunks):
+        t0 = time.perf_counter()
+        r = infer_chunk(source_path, start, end, max_attempts=INFERENCE_MAX_ATTEMPTS)
+        merge_timings(timings, r["timings"])
+        logger.info("Job %s chunk %d/%d [%.0f-%.0fs] took %.2fs: %s",
+                    job_id, i + 1, len(chunks), start, end, time.perf_counter() - t0, r["result"])
+        results.append(r)
+    return results
 
 
 def process_job(conn, job_id: str, message_meta: dict | None = None) -> None:

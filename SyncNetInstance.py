@@ -41,10 +41,10 @@ class SyncNetInstance(torch.nn.Module):
 
         self.__S__ = S(num_layers_in_fc_layers = num_layers_in_fc_layers).to(device);
 
-    @torch.inference_mode()
     def evaluate(self, opt, videofile, timings=None):
+        """File-based entry point (cropped face .avi with audio): decodes it,
+        then delegates to evaluate_arrays."""
 
-        self.__S__.eval();
         tPrep = time.perf_counter()
 
         # ========== ==========
@@ -74,22 +74,38 @@ class SyncNetInstance(torch.nn.Module):
         for fname in flist:
             images.append(cv2.imread(fname))
 
-        im = numpy.stack(images,axis=3)
-        im = numpy.expand_dims(im,axis=0)
-        im = numpy.transpose(im,(0,3,4,1,2))
-
-        imtv = torch.autograd.Variable(torch.from_numpy(im.astype(float)).float())
-
         # ========== ==========
         # Load audio
         # ========== ==========
 
         sample_rate, audio = wavfile.read(os.path.join(opt.tmp_dir,opt.reference,'audio.wav'))
+
+        if timings is not None:
+            timings['syncnet/prep'] = timings.get('syncnet/prep', 0.0) + time.perf_counter() - tPrep
+
+        return self.evaluate_arrays(opt, numpy.stack(images), audio, sample_rate=sample_rate, timings=timings)
+
+    @torch.inference_mode()
+    def evaluate_arrays(self, opt, images, audio, sample_rate=16000, timings=None):
+        """
+        images: (T, H, W, 3) uint8 BGR face crops at 25fps.
+        audio:  mono int16 PCM at sample_rate (16kHz).
+        """
+
+        self.__S__.eval();
+        tPrep = time.perf_counter()
+
+        # (T,H,W,C) -> (1,C,T,H,W), uploaded to the GPU once as uint8. The
+        # overlapping 5-frame windows below are then sliced on-device instead
+        # of each frame being copied host->device 5 times as float32.
+        imtv = torch.from_numpy(numpy.ascontiguousarray(images)).to(device)
+        imtv = imtv.permute(3,0,1,2).unsqueeze(0).float()
+
         mfcc = zip(*python_speech_features.mfcc(audio,sample_rate))
         mfcc = numpy.stack([numpy.array(i) for i in mfcc])
 
         cc = numpy.expand_dims(numpy.expand_dims(mfcc,axis=0),axis=0)
-        cct = torch.autograd.Variable(torch.from_numpy(cc.astype(float)).float())
+        cct = torch.from_numpy(cc.astype(float)).float().to(device)
 
         # ========== ==========
         # Check audio and video input length
@@ -116,12 +132,12 @@ class SyncNetInstance(torch.nn.Module):
             
             im_batch = [ imtv[:,:,vframe:vframe+5,:,:] for vframe in range(i,min(lastframe,i+opt.batch_size)) ]
             im_in = torch.cat(im_batch,0)
-            im_out  = self.__S__.forward_lip(im_in.to(device));
+            im_out  = self.__S__.forward_lip(im_in);
             im_feat.append(im_out.data.cpu())
 
             cc_batch = [ cct[:,:,:,vframe*4:vframe*4+20] for vframe in range(i,min(lastframe,i+opt.batch_size)) ]
             cc_in = torch.cat(cc_batch,0)
-            cc_out  = self.__S__.forward_aud(cc_in.to(device))
+            cc_out  = self.__S__.forward_aud(cc_in)
             cc_feat.append(cc_out.data.cpu())
 
         im_feat = torch.cat(im_feat,0)
